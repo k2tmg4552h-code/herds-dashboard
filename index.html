@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Herds Dashboard</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body { background-color: #0a0a0a; color: white; font-family: Arial, sans-serif; text-align: center; padding: 20px; margin: 0; overflow: hidden; }
+        h1 { color: #89CFF0; letter-spacing: 2px; margin-bottom: 5px; }
+        
+        /* --- NEW: THE VAULT CONTROLS --- */
+        #top-bar { display: flex; justify-content: space-between; align-items: center; max-width: 1000px; margin: 0 auto 20px auto; }
+        #search-box { padding: 10px; border-radius: 20px; border: 1px solid #89CFF0; background: #111; color: white; width: 250px; outline: none; }
+        .toggle-btn { background: #222; color: white; border: 1px solid #555; padding: 10px 20px; cursor: pointer; border-radius: 5px; font-weight: bold; }
+        .toggle-btn.active { background: #89CFF0; color: black; border-color: #89CFF0; }
+        
+        /* The Map and Vault areas */
+        #universe { position: relative; width: 100%; height: 650px; overflow: hidden; cursor: grab; border: 1px solid #222; border-radius: 10px; background-image: radial-gradient(#222 1px, transparent 1px); background-size: 30px 30px; }
+        #universe:active { cursor: grabbing; }
+        #camera { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform-origin: 0 0; }
+        
+        /* --- NEW: THE DATA TABLE --- */
+        #data-vault { display: none; width: 100%; height: 650px; overflow-y: auto; background: #111; border: 1px solid #333; border-radius: 10px; text-align: left; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 15px; border-bottom: 1px solid #333; }
+        th { background: #222; color: #89CFF0; position: sticky; top: 0; }
+        tr:hover { background: #1a1a1a; cursor: pointer; }
+
+        .bubble { color: black; border-radius: 50%; display: flex; flex-direction: column; justify-content: center; align-items: center; font-weight: bold; border: 2px solid rgba(255,255,255,0.2); position: absolute; transform: translate(-50%, -50%); transition: filter 0.3s; box-shadow: inset 0px 0px 20px rgba(0,0,0,0.5); }
+        .bubble:hover { cursor: pointer; border: 2px solid white; filter: brightness(1.3); }
+        
+        @keyframes siren { 0% { box-shadow: 0 0 20px #ff0000; transform: scale(1) translate(-50%, -50%); } 50% { box-shadow: 0 0 60px #ff0000; transform: scale(1.1) translate(-50%, -50%); } 100% { box-shadow: 0 0 20px #ff0000; transform: scale(1) translate(-50%, -50%); } }
+        .spike-alert { background: radial-gradient(circle, #ff4444 10%, #8b0000 100%) !important; animation: siren 1s infinite !important; border: 2px solid white !important; color: white !important; z-index: 200 !important; }
+
+        #panel { display: none; position: fixed; right: 0; top: 0; width: 300px; height: 100%; background-color: #111; border-left: 2px solid #89CFF0; padding: 30px; box-sizing: border-box; text-align: left; box-shadow: -5px 0px 15px rgba(137, 207, 240, 0.2); z-index: 2000; }
+        .close-btn { color: gray; cursor: pointer; font-size: 12px; }
+        #chart-container { width: 100%; height: 120px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>HERDS.</h1>
+    
+    <div id="top-bar">
+        <input type="text" id="search-box" placeholder="Search Master Log..." onkeyup="filterVault()">
+        <div>
+            <span style="color:gray; margin-right: 15px;">Tracking: <b id="total-count" style="color:#89CFF0;">0</b> items</span>
+            <button id="btn-map" class="toggle-btn active" onclick="switchView('map')">LIVE MAP</button>
+            <button id="btn-vault" class="toggle-btn" onclick="switchView('vault')">DATA VAULT</button>
+        </div>
+    </div>
+
+    <div id="universe"><div id="camera"></div></div>
+
+    <div id="data-vault">
+        <table id="vault-table">
+            <thead>
+                <tr>
+                    <th>Product Name</th>
+                    <th>Category</th>
+                    <th>Gravity Score</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="vault-body">
+                </tbody>
+        </table>
+    </div>
+
+    <div id="panel">
+        <span class="close-btn" onclick="document.getElementById('panel').style.display='none'">[X] CLOSE</span>
+        <h2 id="panel-title" style="color: #89CFF0; font-size: 18px;">Item Name</h2>
+        <p>Gravity Score: <b id="panel-score"></b></p>
+        <hr style="border-color: #333; margin-top: 20px;">
+        <p style="color: gray; font-size: 12px; margin-bottom: 0;">GROWTH TREND</p>
+        <div id="chart-container"></div>
+    </div>
+
+    <script>
+        const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
+        const ws = new WebSocket(protocol + window.location.host + "/ws");
+        
+        let latestData = { items: [] };
+        let currentNodes = []; 
+        let selectedItemName = null; 
+
+        const universe = document.getElementById('universe');
+        const camera = document.getElementById('camera');
+        const vault = document.getElementById('data-vault');
+        
+        let width = universe.clientWidth || window.innerWidth;
+        let height = universe.clientHeight || 650;
+        
+        let zoomBehavior = d3.zoom().scaleExtent([0.3, 4]).on("zoom", (event) => {
+            camera.style.transform = `translate(${event.transform.x}px, ${event.transform.y}px) scale(${event.transform.k})`;
+        });
+        d3.select("#universe").call(zoomBehavior);
+
+        let simulation = d3.forceSimulation().velocityDecay(0.3) 
+            .force("charge", d3.forceManyBody().strength(-150)) 
+            .force("x", d3.forceX(width / 2).strength(0.015))
+            .force("y", d3.forceY(height / 2).strength(0.015))
+            .force("collide", d3.forceCollide().radius(d => d.r + 20).strength(1).iterations(4)); 
+
+        ws.onmessage = function(event) {
+            latestData = JSON.parse(event.data);
+            document.getElementById('total-count').innerText = latestData.items.length;
+            
+            drawUniverse(); 
+            buildTable();
+            
+            if (selectedItemName) {
+                let activeItem = latestData.items.find(i => i.name === selectedItemName);
+                if (activeItem) drawChart(activeItem.history);
+            }
+        };
+
+        function switchView(view) {
+            if (view === 'map') {
+                universe.style.display = 'block';
+                vault.style.display = 'none';
+                document.getElementById('btn-map').classList.add('active');
+                document.getElementById('btn-vault').classList.remove('active');
+            } else {
+                universe.style.display = 'none';
+                vault.style.display = 'block';
+                document.getElementById('btn-vault').classList.add('active');
+                document.getElementById('btn-map').classList.remove('active');
+            }
+        }
+
+        function getCategoryColor(category) {
+            let cat = category.toLowerCase();
+            if (cat.includes('tech')) return 'radial-gradient(circle, #00e5ff 10%, #007bb5 100%)'; 
+            if (cat.includes('kitchen')) return 'radial-gradient(circle, #ff8c00 10%, #d84315 100%)'; 
+            return 'radial-gradient(circle, #b388ff 10%, #5e35b1 100%)'; 
+        }
+
+        function openPanel(item) {
+            document.getElementById('panel').style.display = 'block';
+            document.getElementById('panel-title').innerText = item.name;
+            document.getElementById('panel-score').innerText = item.score;
+            selectedItemName = item.name;
+            drawChart(item.history);
+        }
+
+        function buildTable() {
+            const tbody = document.getElementById('vault-body');
+            tbody.innerHTML = "";
+            let filter = document.getElementById('search-box').value.toLowerCase();
+
+            latestData.items.forEach(item => {
+                if (item.name.toLowerCase().includes(filter)) {
+                    let tr = document.createElement('tr');
+                    let status = item.is_spiking ? "<span style='color:red;'>SPIKING</span>" : "<span style='color:gray;'>Normal</span>";
+                    
+                    tr.innerHTML = `
+                        <td>${item.name}</td>
+                        <td style="color: #89CFF0;">${item.category.toUpperCase()}</td>
+                        <td>${item.score}</td>
+                        <td>${status}</td>
+                    `;
+                    tr.onclick = () => openPanel(item);
+                    tbody.appendChild(tr);
+                }
+            });
+        }
+
+        function filterVault() { buildTable(); }
+
+        function drawUniverse() {
+            // ONLY DRAW THE TOP 20 ITEMS SO IT DOES NOT CRASH
+            let mapItems = latestData.items.slice(0, 20);
+            if(mapItems.length === 0) return;
+
+            const maxScore = mapItems[0].score; 
+            let newNodes = mapItems.map((item, index) => {
+                let r = Math.max(30, (item.score / maxScore) * 200) / 2;
+                let oldNode = currentNodes.find(n => n.id === item.name);
+                return {
+                    id: item.name, item: item, r: r, isSun: index === 0,
+                    x: oldNode ? oldNode.x : (width / 2) + (Math.random() - 0.5) * 200,
+                    y: oldNode ? oldNode.y : (height / 2) + (Math.random() - 0.5) * 200,
+                    vx: oldNode ? oldNode.vx : 0, vy: oldNode ? oldNode.vy : 0
+                };
+            });
+
+            currentNodes = newNodes;
+            document.querySelectorAll('.bubble').forEach(e => e.remove());
+
+            currentNodes.forEach(node => {
+                let bubble = document.createElement('div');
+                bubble.className = 'bubble';
+                bubble.id = 'bubble-' + node.id.replace(/[^a-zA-Z0-9]/g, '-');
+                bubble.style.background = getCategoryColor(node.item.category);
+                bubble.innerHTML = `<span style="padding:10px; text-align:center; font-size: 11px; text-shadow: 0px 2px 5px rgba(0,0,0,0.8);">${node.id}</span>`;
+                
+                bubble.onclick = function() { openPanel(node.item); };
+                camera.appendChild(bubble); 
+            });
+
+            simulation.nodes(currentNodes).on("tick", ticked).alpha(1).restart();
+        }
+
+        function ticked() {
+            currentNodes.forEach(d => {
+                if (d.isSun) { d.vx += (width / 2 - d.x) * 0.05; d.vy += (height / 2 - d.y) * 0.05; }
+                let bubble = document.getElementById('bubble-' + d.id.replace(/[^a-zA-Z0-9]/g, '-'));
+                if (bubble) {
+                    bubble.style.left = d.x + 'px'; bubble.style.top = d.y + 'px';
+                    bubble.style.width = (d.r * 2) + 'px'; bubble.style.height = (d.r * 2) + 'px';
+                    if (d.item.is_spiking) { bubble.className = 'bubble spike-alert'; bubble.style.zIndex = 300; } 
+                    else { bubble.className = 'bubble'; bubble.style.zIndex = Math.floor(100 - d.r); }
+                }
+            });
+        }
+
+        function drawChart(historyData) {
+            const container = document.getElementById('chart-container');
+            container.innerHTML = ""; 
+            if (!historyData || historyData.length < 2) {
+                container.innerHTML = "<p style='color:gray; font-size:12px; margin-top:20px;'>Gathering data...</p>";
+                return;
+            }
+            const w = container.clientWidth; const h = container.clientHeight;
+            const svg = d3.select('#chart-container').append('svg').attr('width', w).attr('height', h);
+            const xScale = d3.scaleLinear().domain([0, historyData.length - 1]).range([5, w - 5]);
+            let minVal = d3.min(historyData); let maxVal = d3.max(historyData);
+            if (minVal === maxVal) { minVal = minVal * 0.9; maxVal = maxVal * 1.1; } 
+            else { minVal = minVal * 0.95; maxVal = maxVal * 1.05; }
+            const yScale = d3.scaleLinear().domain([minVal, maxVal]).range([h - 5, 5]);
+            const area = d3.area().x((d, i) => xScale(i)).y0(h).y1(d => yScale(d)).curve(d3.curveMonotoneX);
+            const line = d3.line().x((d, i) => xScale(i)).y(d => yScale(d)).curve(d3.curveMonotoneX);
+            const defs = svg.append("defs");
+            const gradient = defs.append("linearGradient").attr("id", "grad").attr("x1", "0%").attr("y1", "0%").attr("x2", "0%").attr("y2", "100%");
+            gradient.append("stop").attr("offset", "0%").attr("stop-color", "#89CFF0").attr("stop-opacity", 0.4);
+            gradient.append("stop").attr("offset", "100%").attr("stop-color", "#89CFF0").attr("stop-opacity", 0);
+            svg.append('path').datum(historyData).attr('fill', 'url(#grad)').attr('d', area);
+            svg.append('path').datum(historyData).attr('fill', 'none').attr('stroke', '#89CFF0').attr('stroke-width', 2).attr('d', line);
+        }
+    </script>
+</body>
+</html>
